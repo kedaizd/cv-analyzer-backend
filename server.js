@@ -19,7 +19,7 @@ const { JSDOM } = require('jsdom');
 const { Readability } = require('@mozilla/readability');
 
 const app = express();
-const PORT = 3000;
+const PORT = process.env.PORT || 5000; // Użyj 5000 lokalnie
 
 // ==== Konfiguracja GEMINI ====
 if (!process.env.GEMINI_API_KEY) {
