@@ -79,34 +79,38 @@ const extractTextFromCV = async (filePath) => {
 // ==== Endpoint: analiza CV z wieloma URL + dodatkowy opis ====
 app.post('/api/analyze-cv-multiple', upload.single('cv'), async (req, res) => {
     try {
-        const { jobUrls, plan, additionalDescription } = req.body;
+        const { jobUrls, plan, additionalDescription, selectedIndustry } = req.body;
         const urls = JSON.parse(jobUrls);
 
         // Odczyt CV
         const { path: filePath } = req.file;
         let textContent = await extractTextFromCV(filePath);
 
-        // Doklejenie dodatkowego opisu (jeśli istnieje)
+        // Doklejenie dodatkowego opisu, jeśli jest
         if (additionalDescription && additionalDescription.trim()) {
-            textContent += `\n\nDodatkowy opis od kandydata:\n${additionalDescription}`;
+            textContent += `\n\nDodatkowy opis od kandydata:\n${additionalDescription.trim()}`;
         }
 
-        // Usunięcie pliku tymczasowego
+        // Usunięcie pliku po odczycie
         fs.unlink(filePath, (err) => {
             if (err) console.error("⚠️ Błąd przy usuwaniu pliku:", err.message);
         });
 
-        // Pobieranie opisów pracy dla wszystkich URL
+        // Pobranie opisów ofert pracy
         const jobDescriptions = await Promise.all(urls.map(getJobDescriptionWithReadability));
         const combinedJobDescriptions = jobDescriptions.join("\n\n---\n\n");
 
+        // Ustalanie liczby pytań zależnie od planu
         const isFree = plan === "free";
         const numSoft = isFree ? 2 : 7;
         const numHard = isFree ? 2 : 10;
 
         const prompt = `
-Jesteś ekspertem HR. 
-Otrzymasz CV kandydata oraz treść ogłoszeń o pracę.
+Jesteś ekspertem HR. Analizujesz CV kandydata, ogłoszenia o pracę oraz (jeśli podano) dodatkowy opis i branżę.
+
+=== Branża ===
+${selectedIndustry || 'Nie podano'}
+
 Twoje zadania:
 1. Oceń CV ogólnie — mocne i słabe strony i rekomenduj zmiany.
 2. Oceń dopasowanie CV do wszystkich ofert (wskaż dopasowania i braki).
@@ -126,7 +130,7 @@ Zwróć odpowiedź w JSON:
   }
 }
 
-=== CV ===
+=== CV (z opisem kandydata) ===
 ${textContent}
 
 === OGŁOSZENIA ===
@@ -143,7 +147,6 @@ ${combinedJobDescriptions}
             const cleanedResponse = llmResponse.replace(/```json|```/g, '').trim();
             analysis = JSON.parse(cleanedResponse);
 
-            // Obliczenie procentowej oceny dopasowania
             if (analysis?.dopasowanie?.mocne_strony && analysis?.dopasowanie?.obszary_do_poprawy) {
                 const total = analysis.dopasowanie.mocne_strony.length + analysis.dopasowanie.obszary_do_poprawy.length;
                 analysis.dopasowanie_procentowe = total > 0
@@ -155,9 +158,8 @@ ${combinedJobDescriptions}
 
         } catch (parseError) {
             console.error("Błąd parsowania odpowiedzi z Gemini:", parseError);
-            console.error("Oryginalna odpowiedź:", llmResponse);
             analysis = {
-                error: 'Błąd parsowania odpowiedzi z Gemini. Prawdopodobnie model nie zwrócił JSON.',
+                error: 'Błąd parsowania odpowiedzi z Gemini.',
                 rawResponse: llmResponse,
                 dopasowanie_procentowe: 0
             };
@@ -174,6 +176,3 @@ ${combinedJobDescriptions}
     }
 });
 
-app.listen(PORT, () => {
-    console.log(`🚀 Server działa na porcie ${PORT}`);
-});
