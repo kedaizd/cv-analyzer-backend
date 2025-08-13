@@ -61,7 +61,7 @@ const getJobDescriptionWithReadability = async (url) => {
 const extractTextFromCV = async (filePath) => {
     const ext = path.extname(filePath).toLowerCase();
     let textContent = '';
-    
+
     if (ext === '.pdf') {
         const dataBuffer = fs.readFileSync(filePath);
         const pdfData = await pdfParse(dataBuffer);
@@ -72,11 +72,11 @@ const extractTextFromCV = async (filePath) => {
     } else {
         throw new Error('Obsługiwane są tylko pliki PDF i DOCX.');
     }
-    
+
     return textContent;
 };
 
-// ==== Endpoint: analiza CV z wieloma URL + dodatkowy opis ====
+// ==== Endpoint: analiza CV z wieloma URL + dodatkowy opis + wersje branżowe ====
 app.post('/api/analyze-cv-multiple', upload.single('cv'), async (req, res) => {
     try {
         const { jobUrls, plan, additionalDescription, selectedIndustry } = req.body;
@@ -176,3 +176,6 @@ ${combinedJobDescriptions}
     }
 });
 
+app.listen(PORT, () => {
+    console.log(`🚀 Server działa na porcie ${PORT}`);
+});
