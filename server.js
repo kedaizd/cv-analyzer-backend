@@ -175,6 +175,72 @@ ${combinedJobDescriptions}
         res.status(500).json({ error: 'Błąd podczas analizy CV', details: error.message });
     }
 });
+// --- AUTODETEKCJA BRANŻY --- //
+import fetch from 'node-fetch'; // jeśli nie masz: npm install node-fetch
+
+const INDUSTRY_KEYWORDS = {
+  'IT': ['programista', 'developer', 'frontend', 'backend', 'fullstack', 'javascript', 'python', 'java', 'software', 'it'],
+  'Finanse': ['księgowy', 'finanse', 'rachunkowość', 'audyt', 'bankowość', 'analiza finansowa', 'inwestycje'],
+  'Marketing': ['marketing', 'social media', 'kampania', 'reklama', 'SEO', 'SEM', 'content'],
+  'Sprzedaż': ['sprzedawca', 'sales', 'account manager', 'klient', 'handel', 'negocjacje'],
+  'HR': ['rekrutacja', 'hr', 'kadry', 'zasoby ludzkie', 'onboarding'],
+  'Logistyka': ['logistyka', 'transport', 'magazyn', 'łańcuch dostaw', 'spedycja'],
+  'Inżynieria': ['inżynier', 'projektowanie', 'mechanika', 'budowa maszyn', 'automatyka', 'CNC'],
+  'Prawo': ['prawnik', 'radca prawny', 'adwokat', 'prawo', 'umowa', 'kodeks'],
+  'Zdrowie': ['lekarz', 'pielęgniarka', 'medycyna', 'szpital', 'pacjent', 'rehabilitacja'],
+  'Edukacja': ['nauczyciel', 'wykładowca', 'szkolenie', 'edukacja', 'kurs', 'uczeń'],
+  'Consulting': ['konsultant', 'doradztwo', 'strategia', 'analiza biznesowa'],
+  'Inne': []
+};
+
+app.post('/api/detect-industry', async (req, res) => {
+  const { jobUrls } = req.body;
+
+  if (!jobUrls || !Array.isArray(jobUrls) || jobUrls.length === 0) {
+    return res.status(400).json({ error: 'Brak poprawnych linków' });
+  }
+
+  try {
+    // Pobieramy wszystkie ogłoszenia równolegle
+    const fetchPromises = jobUrls.map(async (url) => {
+      try {
+        const response = await fetch(url, { timeout: 8000 });
+        if (!response.ok) {
+          console.warn(`Błąd pobierania ${url}: ${response.status}`);
+          return '';
+        }
+        const html = await response.text();
+        return html.toLowerCase();
+      } catch (err) {
+        console.warn(`Nie udało się pobrać ${url}:`, err.message);
+        return '';
+      }
+    });
+
+    const pages = await Promise.all(fetchPromises);
+
+    let detectedIndustry = '';
+
+    // Szukamy dopasowania w każdej stronie
+    for (const text of pages) {
+      if (!text) continue;
+
+      for (const [industry, keywords] of Object.entries(INDUSTRY_KEYWORDS)) {
+        if (keywords.some(keyword => text.includes(keyword))) {
+          detectedIndustry = industry;
+          break;
+        }
+      }
+      if (detectedIndustry) break; // jeśli znaleziono, kończymy
+    }
+
+    return res.json({ industry: detectedIndustry });
+  } catch (error) {
+    console.error('Błąd /api/detect-industry:', error);
+    res.status(500).json({ error: 'Błąd serwera przy wykrywaniu branży' });
+  }
+});
+
 
 app.listen(PORT, () => {
     console.log(`🚀 Server działa na porcie ${PORT}`);
