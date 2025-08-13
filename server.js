@@ -4,8 +4,8 @@
  * i generowanie analizy.
  */
 
-// Zmieniono 'require' na 'import'
-import { default as pdfParse } from 'pdf-parse';
+// Zmieniono na działający import, który podałeś
+import * as pdfParse from 'pdf-parse/lib/pdf-parse.js';
 import mammoth from 'mammoth';
 import fs from 'fs';
 import path from 'path';
@@ -13,13 +13,13 @@ import express from 'express';
 import cors from 'cors';
 import multer from 'multer';
 import axios from 'axios';
-import 'dotenv/config'; // Zmieniono sposób ładowania dotenv
+import 'dotenv/config';
 
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import { JSDOM } from 'jsdom';
 import { Readability } from '@mozilla/readability';
 
-import fetch from 'node-fetch'; // Upewnij się, że masz zainstalowane
+import fetch from 'node-fetch';
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -64,9 +64,10 @@ const getJobDescriptionWithReadability = async (url) => {
 const extractTextFromCV = async (filePath) => {
     const ext = path.extname(filePath).toLowerCase();
     let textContent = '';
-
+    
     if (ext === '.pdf') {
         const dataBuffer = fs.readFileSync(filePath);
+        // Zmieniono sposób wywołania funkcji, aby pasował do nowego importu
         const pdfData = await pdfParse(dataBuffer);
         textContent = pdfData.text;
     } else if (ext === '.docx') {
@@ -75,7 +76,7 @@ const extractTextFromCV = async (filePath) => {
     } else {
         throw new Error('Obsługiwane są tylko pliki PDF i DOCX.');
     }
-
+    
     return textContent;
 };
 
