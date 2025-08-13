@@ -5,7 +5,7 @@
  */
 
 // Zmieniono 'require' na 'import'
-import pdfParse from 'pdf-parse';
+import { default as pdfParse } from 'pdf-parse';
 import mammoth from 'mammoth';
 import fs from 'fs';
 import path from 'path';
