@@ -19,7 +19,7 @@ const { JSDOM } = require('jsdom');
 const { Readability } = require('@mozilla/readability');
 
 const app = express();
-const PORT = process.env.PORT || 5000; // Użyj 5000 lokalnie
+const PORT = process.env.PORT || 5000;
 
 // ==== Konfiguracja GEMINI ====
 if (!process.env.GEMINI_API_KEY) {
@@ -42,9 +42,7 @@ app.use(express.json());
 const getJobDescriptionWithReadability = async (url) => {
     try {
         const response = await axios.get(url, {
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
-            }
+            headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' }
         });
         const doc = new JSDOM(response.data, { url });
         const reader = new Readability(doc.window.document);
@@ -59,10 +57,7 @@ const getJobDescriptionWithReadability = async (url) => {
     }
 };
 
-// Alias dla kompatybilności z nowym komponentem
-const fetchJobDescription = getJobDescriptionWithReadability;
-
-// ==== Helper function do odczytu CV ====
+// ==== Odczyt CV ====
 const extractTextFromCV = async (filePath) => {
     const ext = path.extname(filePath).toLowerCase();
     let textContent = '';
@@ -81,17 +76,22 @@ const extractTextFromCV = async (filePath) => {
     return textContent;
 };
 
-// ==== Endpoint główny (oryginalny - wielokrotne URL) ====
+// ==== Endpoint: analiza CV z wieloma URL + dodatkowy opis ====
 app.post('/api/analyze-cv-multiple', upload.single('cv'), async (req, res) => {
     try {
-        const { jobUrls, plan } = req.body;
+        const { jobUrls, plan, additionalDescription } = req.body;
         const urls = JSON.parse(jobUrls);
 
         // Odczyt CV
         const { path: filePath } = req.file;
-        const textContent = await extractTextFromCV(filePath);
+        let textContent = await extractTextFromCV(filePath);
 
-        // ⚠️ Ważne: Usunięcie pliku po odczycie
+        // Doklejenie dodatkowego opisu (jeśli istnieje)
+        if (additionalDescription && additionalDescription.trim()) {
+            textContent += `\n\nDodatkowy opis od kandydata:\n${additionalDescription}`;
+        }
+
+        // Usunięcie pliku tymczasowego
         fs.unlink(filePath, (err) => {
             if (err) console.error("⚠️ Błąd przy usuwaniu pliku:", err.message);
         });
@@ -99,6 +99,7 @@ app.post('/api/analyze-cv-multiple', upload.single('cv'), async (req, res) => {
         // Pobieranie opisów pracy dla wszystkich URL
         const jobDescriptions = await Promise.all(urls.map(getJobDescriptionWithReadability));
         const combinedJobDescriptions = jobDescriptions.join("\n\n---\n\n");
+
         const isFree = plan === "free";
         const numSoft = isFree ? 2 : 7;
         const numHard = isFree ? 2 : 10;
@@ -145,13 +146,9 @@ ${combinedJobDescriptions}
             // Obliczenie procentowej oceny dopasowania
             if (analysis?.dopasowanie?.mocne_strony && analysis?.dopasowanie?.obszary_do_poprawy) {
                 const total = analysis.dopasowanie.mocne_strony.length + analysis.dopasowanie.obszary_do_poprawy.length;
-                if (total > 0) {
-                    analysis.dopasowanie_procentowe = Math.round(
-                        (analysis.dopasowanie.mocne_strony.length / total) * 100
-                    );
-                } else {
-                    analysis.dopasowanie_procentowe = 0;
-                }
+                analysis.dopasowanie_procentowe = total > 0
+                    ? Math.round((analysis.dopasowanie.mocne_strony.length / total) * 100)
+                    : 0;
             } else {
                 analysis.dopasowanie_procentowe = 0;
             }
