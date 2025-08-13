@@ -4,8 +4,7 @@
  * i generowanie analizy.
  */
 
-// Zmieniono na działający import, który podałeś
-import helmet from 'helmet';
+// Usunięte: import helmet from 'helmet';
 import * as pdfParse from 'pdf-parse/lib/pdf-parse.js';
 import mammoth from 'mammoth';
 import fs from 'fs';
@@ -42,19 +41,8 @@ if (!fs.existsSync('uploads')) fs.mkdirSync('uploads');
 app.use(cors());
 app.use(express.json());
 
-// Dodaj ten blok z konfiguracją Helmet
-app.use(
-  helmet.contentSecurityPolicy({
-    directives: {
-      defaultSrc: ["'self'"],
-      scriptSrc: ["'self'", "'unsafe-inline'"],
-      styleSrc: ["'self'", "'unsafe-inline'"],
-      imgSrc: ["'self'", "data:"],
-      fontSrc: ["'self'", "data:"],
-      connectSrc: ["'self'", "*"], // Pozwala na zapytania do zewnętrznych API
-    },
-  })
-);
+// ❌ Usunięto Helmet CSP – backend nie wysyła już default-src 'none'
+
 // ==== Pobieranie oferty pracy ====
 const getJobDescriptionWithReadability = async (url) => {
     try {
