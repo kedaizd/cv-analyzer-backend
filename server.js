@@ -392,8 +392,12 @@ ${combinedJD}`;
 
 // 3) GENERACJA PYTAŃ – POST /api/generate-questions
 app.post('/api/generate-questions', jsonParser, async (req, res) => {
+  const normalizeIndustry = (s='') => s.replace(/\s*\/\s*/g, '/').trim();
+  const selectedIndustryRaw = typeof req.body?.selectedIndustry === 'string' ? req.body.selectedIndustry : '';
+  const selectedIndustry = normalizeIndustry(selectedIndustryRaw);
+
   try {
-    const { selectedIndustry, plan = 'free' } = req.body || {};
+    const { plan = 'free' } = req.body || {}; // Użyj destrukturyzacji tylko dla 'plan'
     const urls = normalizeToArray(req.body?.jobUrls || req.body?.urls);
 
     const isFree = String(plan).toLowerCase() === 'free';
