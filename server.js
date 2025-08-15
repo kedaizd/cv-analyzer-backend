@@ -12,6 +12,9 @@ import cors from 'cors';
 import multer from 'multer';
 import axios from 'axios';
 import { createRequire } from 'module';
+import rateLimit from 'express-rate-limit';
+import nodemailer from 'nodemailer';
+import validator from 'validator';
 const require = createRequire(import.meta.url);
 // pdf-parse (bez demo index)
 const pdfParse = require('pdf-parse/lib/pdf-parse.js');
@@ -44,6 +47,25 @@ const clampText = (str, max) => {
   const s = String(str || '');
   return s.length > max ? s.slice(0, max) + '…' : s;
 };
+
+// Rate limit: max 10 zapytań / 15 minut z 1 IP
+const contactLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false
+});
+
+// Transport e-mail (SMTP z .env)
+const mailTransport = nodemailer.createTransport({
+  host: process.env.SMTP_HOST,
+  port: Number(process.env.SMTP_PORT || 587),
+  secure: false,
+  auth: {
+    user: process.env.SMTP_USER,
+    pass: process.env.SMTP_PASS
+  }
+});
 
 // ==== UPLOAD ====
 if (!fs.existsSync('uploads')) fs.mkdirSync('uploads', { recursive: true });
@@ -179,6 +201,31 @@ const ensureAnalysisShape = (a = {}) => ({
     kompetencje_twarde: Array.isArray(a?.pytania?.kompetencje_twarde) ? a.pytania.kompetencje_twarde : []
   }
 });
+
+// --- STAR: kształt odpowiedzi i sanitizacja ---
+const ensureStarShape = (a = {}) => ({
+  answer: String(a.answer || '').trim(),
+  feedback: Array.isArray(a.feedback) ? a.feedback : [],
+  grade: String(a.grade || '').trim(), // np. A, B, C (albo 1-6)
+  scores: {
+    clarity: Number(a?.scores?.clarity ?? 0),     // 0-100
+    impact: Number(a?.scores?.impact ?? 0),
+    metrics: Number(a?.scores?.metrics ?? 0),
+    ownership: Number(a?.scores?.ownership ?? 0),
+    relevance: Number(a?.scores?.relevance ?? 0),
+  },
+  tips: Array.isArray(a.tips) ? a.tips : [],
+  red_flags: Array.isArray(a.red_flags) ? a.red_flags : [],
+  length_chars: Number(a.length_chars ?? 0),
+});
+
+const STAR_LIMITS = {
+  maxFieldChars: 1200,      // każdy z S/T/A/R
+  maxOutputChars: 2000,     // gotowa odpowiedź
+  maxItemChars: 200
+};
+
+const hasNumbers = (txt='') => /\d/.test(txt);
 const sanitizeStringArray = (arr, maxLen) => {
   if (!Array.isArray(arr)) return [];
   return arr.map(x => clampText(String(x || '').trim(), maxLen)).filter(Boolean);
@@ -286,6 +333,48 @@ const jaccard = (arrA = [], arrB = []) => {
   return inter / uni; // 0..1
 };
 
+// --- JD DIFF: pomocnicze ---
+const DIFF_LIMITS = { maxJobs: 5, maxReqItemChars: 180 };
+
+const normalizeWhitespace = (s='') => String(s).replace(/\s+/g, ' ').trim();
+
+const dedupKeepOrder = (arr=[]) => {
+  const seen = new Set(); const out = [];
+  for (const x of arr) { const y = x.trim(); if (!y || seen.has(y)) continue; seen.add(y); out.push(y); }
+  return out;
+};
+
+const intersectMany = (arrays) => {
+  if (!arrays.length) return [];
+  return arrays.reduce((acc, cur) => acc.filter(x => cur.includes(x)));
+};
+
+const llmExtractRequirements = async (text) => {
+  const prompt = `
+Wypisz wymagania/kompetencje z poniższego ogłoszenia o pracę jako czystą listę JSON (tablica stringów, bez markdown). Każdy punkt krótki (<= ${DIFF_LIMITS.maxReqItemChars} znaków).
+OGŁOSZENIE:
+${String(text).slice(0, 8000)}
+ZWRÓĆ TYLKO TABLICĘ JSON.`;
+  const raw = await generateWithFallback(prompt);
+  try {
+    const arr = extractAndParseJSON(raw);
+    return sanitizeStringArray(arr, DIFF_LIMITS.maxReqItemChars);
+  } catch {
+    // fallback: proste wyłuskanie "bulletów"
+    const bullets = text.split(/\n|•|- |\* /).map(x => x.trim()).filter(x => x.length > 5);
+    return sanitizeStringArray(bullets.slice(0, 30), DIFF_LIMITS.maxReqItemChars);
+  }
+};
+
+const fitScoreFromKeywords = (cvText, reqs) => {
+  const cvKW = new Set(simpleKeywords(cvText, { topN: 120 }));
+  const reqKW = new Set(simpleKeywords(reqs.join(' '), { topN: 120 }));
+  const overlap = [...reqKW].filter(k => cvKW.has(k)).length;
+  const denom = Math.max(1, reqKW.size);
+  return Math.round((overlap / denom) * 100); // 0..100
+};
+
+
 // Klasyfikator branża/rola (Gemini)
 const classifyText = async (text, kind = 'CV') => {
   try {
@@ -339,6 +428,12 @@ ${cvText}`;
     try {
       const parsed = extractAndParseJSON(llmRaw);
       analysis = ensureAnalysisShape(parsed);
+      // --- enforce plan limits on number of questions ---
+analysis.pytania.kompetencje_miekkie =
+  sanitizeStringArray(analysis.pytania.kompetencje_miekkie, LIMITS.itemChars).slice(0, numSoft);
+
+analysis.pytania.kompetencje_twarde =
+  sanitizeStringArray(analysis.pytania.kompetencje_twarde, LIMITS.itemChars).slice(0, numHard);
     } catch {
       analysis.podsumowanie = 'Nie udało się poprawnie sparsować odpowiedzi modelu.';
       analysis.rawResponse = String(llmRaw || '').slice(0, 2000);
@@ -435,7 +530,277 @@ ${combinedJD || '(brak)'}
   }
 });
 
-// 4) SCALONY FLOW – POST /api/analyze-cv-multiple
+// 4) COACH STAR – POST /api/star-coach
+app.post('/api/star-coach', jsonParser, async (req, res) => {
+  try {
+    const { situation='', task='', action='', result='', role='', language='pl', tone='concise', plan='free' } = req.body || {};
+
+    // Twarde limity wejścia
+    const S = clampText(String(situation), STAR_LIMITS.maxFieldChars);
+    const T = clampText(String(task), STAR_LIMITS.maxFieldChars);
+    const A = clampText(String(action), STAR_LIMITS.maxFieldChars);
+    const R = clampText(String(result), STAR_LIMITS.maxFieldChars);
+
+    // Heurystyka: czy są liczby/metryki?
+    const metricsHint = [R, A].some(hasNumbers);
+
+    // Prompt z twardym JSON-em
+    const lang = (language || 'pl').toLowerCase().startsWith('en') ? 'en' : 'pl';
+    const toneMap = { concise: (lang==='pl'?'zwięźle':'concise'), professional: (lang==='pl'?'profesjonalnie':'professional'), enthusiastic: (lang==='pl'?'energicznie':'enthusiastic') };
+    const toneLabel = toneMap[tone] || toneMap.concise;
+
+    const prompt = `
+Jesteś coachem odpowiedzi metodą STAR. Z poniższych pól (Sytuacja, Zadanie, Akcja, Rezultat) zbuduj krótką, mocną odpowiedź i oceń ją.
+
+JEZYK ODPOWIEDZI: ${lang==='pl'?'polski':'english'}
+STYL: ${toneLabel}
+KONTEKST ROLI (opcjonalny): ${role || (lang==='pl'?'(brak)':'(none)')}
+
+WYTYCZNE:
+- Odpowiedź ma mieścić się w ${STAR_LIMITS.maxOutputChars} znakach (krótko, esencja).
+- Używaj liczb/KPI jeżeli istnieją w wejściu; jeśli brak, zasugeruj jak je dodać.
+- Zachowaj strukturę STAR (1 akapit, logiczne zdania).
+- Unikaj żargonu i zbyt długich wstępów.
+- Ton: ${toneLabel}.
+- Zwróć TYLKO JSON bez markdown.
+
+FORMAT JSON:
+{
+  "answer": "gotowa odpowiedź STAR (max ${STAR_LIMITS.maxOutputChars} znaków)",
+  "feedback": ["1-3 krótkie uwagi konstruktywne (max ${STAR_LIMITS.maxItemChars} znaków każda)"],
+  "grade": "A|B|C|D|E",
+  "scores": {
+    "clarity": 0-100,
+    "impact": 0-100,
+    "metrics": 0-100,
+    "ownership": 0-100,
+    "relevance": 0-100
+  },
+  "tips": ["1-3 konkretne wskazówki jak podnieść ocenę (max ${STAR_LIMITS.maxItemChars} znaków)"],
+  "red_flags": ["opcjonalne ryzyka/braki jeśli są (max ${STAR_LIMITS.maxItemChars} znaków)"],
+  "length_chars": <długość pola answer>
+}
+
+DANE WEJŚCIOWE:
+[S] ${S}
+[T] ${T}
+[A] ${A}
+[R] ${R}
+
+WSKAZÓWKA: ${metricsHint ? (lang==='pl'?'Wejście zawiera liczby — włącz je do odpowiedzi.':'Input already includes metrics — use them.') : (lang==='pl'?'Wejście nie zawiera liczb — zasugeruj mierniki.':'No metrics detected — suggest KPIs.')}
+`.trim();
+
+    const llmRaw = await generateWithFallback(prompt);
+    let star = ensureStarShape({});
+    try {
+      const parsed = extractAndParseJSON(llmRaw);
+      star = ensureStarShape(parsed);
+    } catch (e) {
+      // Fallback najprostszy, gdyby JSON nie przeszedł
+      const fallbackAnswer = `${lang==='pl'
+        ? 'S: ' + S + ' | T: ' + T + ' | A: ' + A + ' | R: ' + R
+        : 'S: ' + S + ' | T: ' + T + ' | A: ' + A + ' | R: ' + R}`;
+      star.answer = clampText(fallbackAnswer, STAR_LIMITS.maxOutputChars);
+      star.feedback = [(lang==='pl'?'Nie udało się w pełni przetworzyć odpowiedzi AI.':'Could not fully parse AI output.')];
+      star.grade = 'C';
+      star.scores = { clarity: 50, impact: 45, metrics: metricsHint?60:30, ownership: 50, relevance: 60 };
+      star.tips = [(lang==='pl'?'Dodaj liczby/rezultaty (%, PLN, czas).':'Add metrics (%, $, time).')];
+      star.red_flags = [];
+      star.length_chars = star.answer.length;
+    }
+
+    // Sanitizacja i twarde limity
+    star.answer = clampText(star.answer, STAR_LIMITS.maxOutputChars);
+    star.feedback = sanitizeStringArray(star.feedback, STAR_LIMITS.maxItemChars).slice(0, 3);
+    star.tips = sanitizeStringArray(star.tips, STAR_LIMITS.maxItemChars).slice(0, 3);
+    star.red_flags = sanitizeStringArray(star.red_flags, STAR_LIMITS.maxItemChars).slice(0, 3);
+    star.length_chars = star.answer.length;
+
+    // Analityka koszykowa (lekka) w logu
+    console.log('[STAR]', {
+      ab: req.abVariant,
+      grade: star.grade,
+      metrics: star.scores.metrics,
+      length: star.length_chars
+    });
+
+    return res.json({ status: 'success', star });
+  } catch (error) {
+    console.error('🔥 /api/star-coach', error);
+    return res.status(500).json({ error: 'Błąd generowania odpowiedzi STAR', details: error.message });
+  }
+});
+
+// 5) JD DIFF — POST /api/jd-diff
+// Form-data (z CV): cv(file), jobUrls(json lub newline string)
+// albo JSON bez pliku: { jobUrls: [...], cvText?: "..." }
+app.post('/api/jd-diff', upload.single('cv'), async (req, res) => {
+  let uploadedFilePath;
+  try {
+    const isMultipart = !!req.file || (req.headers['content-type']||'').includes('multipart/form-data');
+    const urlsRaw = isMultipart ? (req.body?.jobUrls ?? req.body?.urls) : (req.body?.jobUrls ?? req.body?.urls);
+    let urls = normalizeToArray(urlsRaw);
+    if (!urls.length) return res.status(400).json({ error: 'Podaj 2–5 linków do ogłoszeń (jobUrls).' });
+    if (urls.length < 2 || urls.length > DIFF_LIMITS.maxJobs) {
+      return res.status(400).json({ error: `Dozwolone 2–${DIFF_LIMITS.maxJobs} ogłoszeń.` });
+    }
+
+    // CV tekst: z pliku, albo z JSON (cvText), albo puste
+    let cvText = '';
+    if (req.file) {
+      uploadedFilePath = req.file.path;
+      cvText = await extractTextFromCV(uploadedFilePath);
+    } else if (!isMultipart && typeof req.body?.cvText === 'string') {
+      cvText = clampText(req.body.cvText, LIMITS.cvChars);
+    }
+
+    // Pobierz i przygotuj JD
+    const jdTexts = await Promise.all(urls.map(getJobDescriptionWithReadability));
+    const items = [];
+    for (let i = 0; i < jdTexts.length; i++) {
+      const url = urls[i];
+      const text = normalizeWhitespace(jdTexts[i] || '');
+      const reqs = dedupKeepOrder(await llmExtractRequirements(text));
+      items.push({ url, text, requirements: reqs });
+    }
+
+    // Wspólne i unikalne wymagania
+    const reqArrays = items.map(x => x.requirements);
+    const common = intersectMany(reqArrays);
+    const uniqueBy = {};
+    items.forEach((it, idx) => {
+      const others = dedupKeepOrder([].concat(...reqArrays.filter((_, j) => j !== idx)));
+      uniqueBy[it.url] = it.requirements.filter(r => !others.includes(r));
+    });
+
+    // Dopasowanie CV → każdy JD
+    const perJob = items.map(it => {
+      const score = cvText ? fitScoreFromKeywords(cvText, it.requirements) : null;
+      return {
+        url: it.url,
+        total_requirements: it.requirements.length,
+        fit_score: score, // null gdy brak CV
+        top_missing: cvText
+          ? it.requirements
+              .filter(r => fitScoreFromKeywords(r, [r]) === 0) // prosta heurystyka: brak słów kluczowych z punktu
+              .slice(0, 5)
+          : []
+      };
+    });
+
+    // Syntetyczne słowa kluczowe dla wglądu (nieobowiązkowe)
+    const jdKW = simpleKeywords(items.map(i => i.text).join(' '), { topN: 60 });
+
+    // Meta
+    const meta = {
+      jobs_count: items.length,
+      with_cv: !!cvText,
+      ab_variant: req.abVariant
+    };
+
+    // Log
+    console.log('[JD-DIFF]', {
+      jobs: items.length,
+      with_cv: !!cvText,
+      common_count: common.length
+    });
+
+    return res.json({
+  status: 'success',
+  diff: {
+    common_requirements: common,
+    unique_by_job: uniqueBy,
+    per_job: perJob,
+    jd_keywords: jdKW,
+    // NOWE: pełne wymagania per ogłoszenie (przydadzą się do CSV w froncie)
+    requirements_by_job: items.map((it, idx) => ({
+      id: `job_${idx+1}`,
+      label: it.url,
+      requirements: it.requirements
+    }))
+  },
+  meta
+});
+  } catch (err) {
+    console.error('🔥 /api/jd-diff', err);
+    return res.status(500).json({ error: 'Błąd porównania ogłoszeń', details: err.message });
+  } finally {
+    if (uploadedFilePath) fs.unlink(uploadedFilePath, () => {});
+  }
+});
+
+// 7) JD DIFF (from text) — POST /api/jd-diff-from-text
+// JSON body: { jdTexts: [string, ...], labels?: [string,...], cvText?: string }
+app.post('/api/jd-diff-from-text', jsonParser, async (req, res) => {
+  try {
+    const jdTexts = Array.isArray(req.body?.jdTexts) ? req.body.jdTexts.map(x => normalizeWhitespace(String(x||''))) : [];
+    const labels = Array.isArray(req.body?.labels) ? req.body.labels.map(x => String(x||'')) : [];
+    const cvText = typeof req.body?.cvText === 'string' ? clampText(req.body.cvText, LIMITS.cvChars) : '';
+
+    if (jdTexts.length < 2 || jdTexts.length > DIFF_LIMITS.maxJobs) {
+      return res.status(400).json({ error: `Podaj 2–${DIFF_LIMITS.maxJobs} treści ogłoszeń w polu jdTexts.` });
+    }
+
+    // Ekstrakcja wymagań z każdego JD
+    const items = [];
+    for (let i = 0; i < jdTexts.length; i++) {
+      const text = jdTexts[i];
+      const reqs = dedupKeepOrder(await llmExtractRequirements(text));
+      const label = labels[i] && labels[i].trim() ? labels[i].trim() : `JD #${i+1}`;
+      items.push({ label, text, requirements: reqs });
+    }
+
+    const reqArrays = items.map(x => x.requirements);
+    const common = intersectMany(reqArrays);
+
+    const uniqueBy = {};
+    items.forEach((it, idx) => {
+      const others = dedupKeepOrder([].concat(...reqArrays.filter((_, j) => j !== idx)));
+      uniqueBy[it.label] = it.requirements.filter(r => !others.includes(r));
+    });
+
+    const perJob = items.map(it => {
+      const score = cvText ? fitScoreFromKeywords(cvText, it.requirements) : null;
+      return {
+        label: it.label,
+        total_requirements: it.requirements.length,
+        fit_score: score,
+        top_missing: cvText
+          ? it.requirements
+              .filter(r => fitScoreFromKeywords(r, [r]) === 0)
+              .slice(0, 5)
+          : []
+      };
+    });
+
+    const jdKW = simpleKeywords(items.map(i => i.text).join(' '), { topN: 60 });
+    const meta = { jobs_count: items.length, with_cv: !!cvText, ab_variant: req.abVariant };
+
+    console.log('[JD-DIFF-TEXT]', { jobs: items.length, with_cv: !!cvText, common_count: common.length });
+
+    return res.json({
+      status: 'success',
+      diff: {
+        common_requirements: common,
+        unique_by_job: uniqueBy,
+        per_job: perJob,
+        jd_keywords: jdKW,
+        // pełne wymagania per JD (z etykietami)
+        requirements_by_job: items.map((it, idx) => ({
+          id: `job_${idx+1}`,
+          label: it.label,
+          requirements: it.requirements
+        }))
+      },
+      meta
+    });
+  } catch (err) {
+    console.error('🔥 /api/jd-diff-from-text', err);
+    return res.status(500).json({ error: 'Błąd porównania ogłoszeń (tekst)', details: err.message });
+  }
+});
+
+// 6) SCALONY FLOW – POST /api/analyze-cv-multiple
 app.post('/api/analyze-cv-multiple', upload.single('cv'), async (req, res) => {
   console.log("---- /api/analyze-cv-multiple ----");
   console.log("Plik:", req.file?.originalname);
@@ -502,6 +867,12 @@ Efektywna branża analizy: "${effectiveIndustry}"
 2) Pytania generuj **pod JD/efektywną branżę**, nie pod CV przy konflikcie.
 3) Rekomendacje CV mają zwiększać dopasowanie do JD (transferowalne kompetencje).
 4) Wskaż ryzyko niedopasowania (CV≠JD) + zaproponuj most (kursy, projekty).
+
+=== OGRANICZENIA FORMATU ===
+- ZWRÓĆ WYŁĄCZNIE JSON bez komentarzy i bez markdown.
+- Dokładnie ${numSoft} pozycji w "kompetencje_miekkie".
+- Dokładnie ${numHard} pozycji w "kompetencje_twarde".
+- Każda pozycja ma maksymalnie ${LIMITS.itemChars} znaków.
 
 === FORMAT JSON ===
 {
@@ -639,4 +1010,41 @@ app.use((error, req, res, next) => {
 // ==== START ====
 app.listen(PORT, () => {
   console.log(`🚀 Server działa na porcie ${PORT}`);
+});
+
+app.post('/api/contact', jsonParser, contactLimiter, async (req, res) => {
+  try {
+    const { name, email, message, website } = req.body || {};
+
+    // Honeypot: jeśli bot wypełni "website" → udaj sukces i wyjdź
+    if (website && String(website).trim() !== '') {
+      return res.json({ ok: true });
+    }
+
+    // Walidacje
+    if (!name || !email || !message) {
+      return res.status(400).json({ error: 'Brak wymaganych pól' });
+    }
+    if (!validator.isEmail(String(email))) {
+      return res.status(400).json({ error: 'Nieprawidłowy adres e-mail' });
+    }
+    const cleanName = String(name).trim().slice(0, 120);
+    const cleanEmail = String(email).trim().slice(0, 180);
+    const cleanMsg = String(message).trim().slice(0, 5000);
+
+    // Wyślij e-mail do siebie
+    const toAddress = process.env.CONTACT_TO || process.env.SMTP_USER;
+    await mailTransport.sendMail({
+      from: `"Interview Prep – Formularz" <${process.env.SMTP_USER}>`,
+      to: toAddress,
+      replyTo: cleanEmail,
+      subject: `Nowe zgłoszenie kontaktowe od: ${cleanName}`,
+      text: `Imię i nazwisko: ${cleanName}\nE-mail: ${cleanEmail}\n\nWiadomość:\n${cleanMsg}`
+    });
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error('❌ /api/contact', err);
+    return res.status(500).json({ error: 'Błąd wysyłki wiadomości' });
+  }
 });
